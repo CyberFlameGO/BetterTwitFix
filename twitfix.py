@@ -1,18 +1,23 @@
-from flask import Flask, render_template, request, redirect, Response, send_from_directory, url_for, send_file, make_response, jsonify
+from random import Random, random
+from weakref import finalize
+from flask import Flask, render_template, request, redirect, abort, Response, send_from_directory, url_for, send_file, make_response, jsonify
 from flask_cors import CORS
-import youtube_dl
+import yt_dlp
 import textwrap
 import twitter
-import pymongo
 import requests
-import json
 import re
 import os
 import urllib.parse
 import urllib.request
-from datetime import date
-import boto3
-
+import combineImg
+from datetime import date,datetime, timedelta
+from io import BytesIO
+import msgs
+import twExtract as twExtract
+from configHandler import config
+from cache import addVnfToLinkCache,getVnfFromLinkCache
+import random
 app = Flask(__name__)
 CORS(app)
 
@@ -32,81 +37,11 @@ generate_embed_user_agents = [
     "Mozilla/5.0 (compatible; January/1.0; +https://gitlab.insrt.uk/revolt/january)", 
     "test"]
 
-# Read config from config.json. If it does not exist, create new.
-if not os.path.exists("config.json"):
-    serverless_check = os.environ.get('RUNNING_SERVERLESS')
-    if serverless_check == None: # Running on local pc, therefore we can access the filesystem
-        with open("config.json", "w") as outfile:
-            default_config = {
-                "config":{
-                    "link_cache":"dynamodb",
-                    "database":"[url to mongo database goes here]",
-                    "table":"TwiFix",
-                    "method":"youtube-dl", 
-                    "color":"#43B581", 
-                    "appname": "vxTwitter", 
-                    "repo": "https://github.com/dylanpdx/BetterTwitFix", 
-                    "url": "https://vxtwitter.com"
-                    },
-                "api":{"api_key":"[api_key goes here]",
-                "api_secret":"[api_secret goes here]",
-                "access_token":"[access_token goes here]",
-                "access_secret":"[access_secret goes here]"
-                }
-            }
-            json.dump(default_config, outfile, indent=4, sort_keys=True)
-    else: # Running on serverless, therefore we cannot access the filesystem and must use environment variables
-            default_config = {
-                "config":{
-                    "link_cache":os.environ['VXTWITTER_LINK_CACHE'],
-                    "database":os.environ['VXTWITTER_DATABASE'],
-                    "table":os.environ['VXTWITTER_DATABASE_TABLE'],
-                    "method":os.environ['VXTWITTER_METHOD'],
-                    "color":os.environ['VXTWITTER_COLOR'],
-                    "appname": os.environ['VXTWITTER_APP_NAME'],
-                    "repo": os.environ['VXTWITTER_REPO'],
-                    "url": os.environ['VXTWITTER_URL'],
-                    },
-                "api":{
-                    "api_key":os.environ['VXTWITTER_TWITTER_API_KEY'],
-                    "api_secret":os.environ['VXTWITTER_TWITTER_API_SECRET'],
-                    "access_token":os.environ['VXTWITTER_TWITTER_ACCESS_TOKEN'],
-                    "access_secret":os.environ['VXTWITTER_TWITTER_ACCESS_SECRET']
-                }
-            }
-
-    config = default_config
-else:
-    f = open("config.json")
-    config = json.load(f)
-    f.close()
 
 # If method is set to API or Hybrid, attempt to auth with the Twitter API
 if config['config']['method'] in ('api', 'hybrid'):
     auth = twitter.oauth.OAuth(config['api']['access_token'], config['api']['access_secret'], config['api']['api_key'], config['api']['api_secret'])
     twitter_api = twitter.Twitter(auth=auth)
-
-link_cache_system = config['config']['link_cache']
-DYNAMO_CACHE_TBL=None
-if link_cache_system=="dynamodb":
-    DYNAMO_CACHE_TBL=os.environ['CACHE_TABLE']
-
-if link_cache_system == "json":
-    link_cache = {}
-    if not os.path.exists("config.json"):
-        with open("config.json", "w") as outfile:
-            default_link_cache = {"test":"test"}
-            json.dump(default_link_cache, outfile, indent=4, sort_keys=True)
-
-    f = open('links.json',)
-    link_cache = json.load(f)
-    f.close()
-elif link_cache_system == "db":
-    client = pymongo.MongoClient(config['config']['database'], connect=False)
-    table = config['config']['table']
-    db = client[table]
-elif link_cache_system == "dynamodb":
-    client = boto3.resource('dynamodb')
 
 @app.route('/') # If the useragent is discord, return the embed, if not, redirect to configured repo directly
 def default():
@@ -131,16 +66,34 @@ def twitfix(sub_path):
     print(request.url)
 
     if request.url.startswith("https://d.vx"): # Matches d.fx? Try to give the user a direct link
+        if match.start() == 0:
+            twitter_url = "https://twitter.com/" + sub_path
         if user_agent in generate_embed_user_agents:
             print( " ➤ [ D ] d.vx link shown to discord user-agent!")
             if request.url.endswith(".mp4") and "?" not in request.url:
-                return dl(sub_path)
+                # TODO: Cache this, but not for too long as disk space can fill up
+                if "?" not in request.url:
+                    clean = twitter_url[:-4]
+                else:
+                    clean = twitter_url
+                vid = requests.get(direct_video_link(clean))
+                return Response(vid.content,mimetype="video/mp4")
             else:
                 return message("To use a direct MP4 link in discord, remove anything past '?' and put '.mp4' at the end")
         else:
             print(" ➤ [ R ] Redirect to MP4 using d.fxtwitter.com")
             return dir(sub_path)
+    elif request.url.startswith("https://c.vx"):
+        twitter_url = sub_path
 
+        if match.start() == 0:
+            twitter_url = "https://twitter.com/" + sub_path
+        
+        if user_agent in generate_embed_user_agents:
+            return embedCombined(twitter_url)
+        else:
+            print(" ➤ [ R ] Redirect to " + twitter_url)
+            return redirect(twitter_url, 301)
     elif request.url.endswith(".mp4") or request.url.endswith("%2Emp4"):
         twitter_url = "https://twitter.com/" + sub_path
         
@@ -148,8 +101,9 @@ def twitfix(sub_path):
             clean = twitter_url[:-4]
         else:
             clean = twitter_url
-
-        return dl(clean)
+        # TODO: Cache this, but not for too long as disk space can fill up
+        vid = requests.get(direct_video_link(clean))
+        return Response(vid.content,mimetype="video/mp4")
 
     # elif request.url.endswith(".json") or request.url.endswith("%2Ejson"):
     #     twitter_url = "https://twitter.com/" + sub_path
@@ -222,6 +176,33 @@ def favicon():
     return send_from_directory(os.path.join(app.root_path, 'static'),
                           'favicon.ico',mimetype='image/vnd.microsoft.icon')
 
+@app.route("/rendercombined.jpg")
+def rendercombined():
+    # get "imgs" from request arguments
+    imgs = request.args.get("imgs", "")
+
+    if 'combination_method' in config['config'] and config['config']['combination_method'] != "local":
+        url = config['config']['combination_method'] + "/rendercombined.jpg?imgs=" + imgs
+        return redirect(url, 302)
+    # Redirecting here instead of setting the embed URL directly to this because if the config combination_method changes in the future, old URLs will still work
+
+    imgs = imgs.split(",")
+    if (len(imgs) == 0 or len(imgs)>4):
+        abort(400)
+    #check that each image starts with "https://pbs.twimg.com"
+    for img in imgs:
+        if not img.startswith("https://pbs.twimg.com"):
+            abort(400)
+    finalImg= combineImg.genImageFromURL(imgs)
+    imgIo = BytesIO()
+    finalImg = finalImg.convert("RGB")
+    finalImg.save(imgIo, 'JPEG',quality=70)
+    imgIo.seek(0)
+    return send_file(imgIo, mimetype='image/jpeg')
+
+def getDefaultTTL():
+    return datetime.today().replace(microsecond=0) + timedelta(days=1)
+
 def direct_video(video_link): # Just get a redirect to a MP4 link from any tweet link
     cached_vnf = getVnfFromLinkCache(video_link)
     if cached_vnf == None:
@@ -232,7 +213,7 @@ def direct_video(video_link): # Just get a redirect to a MP4 link from any tweet
             print(" ➤ [ D ] Redirecting to direct URL: " + vnf['url'])
         except Exception as e:
             print(e)
-            return message("Failed to scan your link!")
+            return message(msgs.failedToScan)
     else:
         return redirect(cached_vnf['url'], 301)
         print(" ➤ [ D ] Redirecting to direct URL: " + vnf['url'])
@@ -247,7 +228,7 @@ def direct_video_link(video_link): # Just get a redirect to a MP4 link from any 
             print(" ➤ [ D ] Redirecting to direct URL: " + vnf['url'])
         except Exception as e:
             print(e)
-            return message("Failed to scan your link!")
+            return message(msgs.failedToScan)
     else:
         return cached_vnf['url']
         print(" ➤ [ D ] Redirecting to direct URL: " + vnf['url'])
@@ -263,11 +244,13 @@ def embed_video(video_link, image=0): # Return Embed from any tweet link
 
         except Exception as e:
             print(e)
-            return message("Failed to scan your link!")
+            return message(msgs.failedToScan)
     else:
         return embed(video_link, cached_vnf, image)
 
-def tweetInfo(url, tweet="", desc="", thumb="", uploader="", screen_name="", pfp="", tweetType="", images="", hits=0, likes=0, rts=0, time="", qrt={}, nsfw=False): # Return a dict of video info with default values
+def tweetInfo(url, tweet="", desc="", thumb="", uploader="", screen_name="", pfp="", tweetType="", images="", hits=0, likes=0, rts=0, time="", qrt={}, nsfw=False,ttl=None): # Return a dict of video info with default values
+    if (ttl==None):
+        ttl = getDefaultTTL()
     vnf = {
         "tweet"         : tweet,
         "url"           : url,
@@ -283,16 +266,19 @@ def tweetInfo(url, tweet="", desc="", thumb="", uploader="", screen_name="", pfp
         "rts"           : rts,
         "time"          : time,
         "qrt"           : qrt,
-        "nsfw"          : nsfw
+        "nsfw"          : nsfw,
+        "ttl"           : ttl
     }
     return vnf
 
-def link_to_vnf_from_api(video_link):
+def get_tweet_data_from_api(video_link):
     print(" ➤ [ + ] Attempting to download tweet info from Twitter API")
     twid = int(re.sub(r'\?.*$','',video_link.rsplit("/", 1)[-1])) # gets the tweet ID as a int from the passed url
     tweet = twitter_api.statuses.show(_id=twid, tweet_mode="extended")
-    # For when I need to poke around and see what a tweet looks like
-    print(tweet)
+    #print(tweet) # For when I need to poke around and see what a tweet looks like
+    return tweet
+
+def link_to_vnf_from_tweet_data(tweet,video_link):
     imgs = ["","","","", ""]
     print(" ➤ [ + ] Tweet Type: " + tweetType(tweet))
     # Check to see if tweet has a video, if not, make the url passed to the VNF the first t.co link in the tweet
@@ -303,6 +289,7 @@ def link_to_vnf_from_api(video_link):
             for video in tweet['extended_entities']['media'][0]['video_info']['variants']:
                 if video['content_type'] == "video/mp4" and video['bitrate'] > best_bitrate:
                     url = video['url']
+                    best_bitrate = video['bitrate']
     elif tweetType(tweet) == "Text":
         url   = ""
         thumb = ""
@@ -333,6 +320,10 @@ def link_to_vnf_from_api(video_link):
     else:
         nsfw = False
 
+    if 'entities' in tweet and 'urls' in tweet['entities']:
+        for eurl in tweet['entities']['urls']:
+            text = text.replace(eurl["url"],eurl["expanded_url"])
+
     vnf = tweetInfo(
         url, 
         video_link, 
@@ -351,9 +342,28 @@ def link_to_vnf_from_api(video_link):
         
     return vnf
 
+
+def link_to_vnf_from_unofficial_api(video_link):
+    print(" ➤ [ + ] Attempting to download tweet info from UNOFFICIAL Twitter API")
+    try:
+        tweet = twExtract.extractStatus(video_link)
+    except Exception as e:
+        print(' ➤ [ !!! ] Local UNOFFICIAL API Failed')
+        if ('apiMirrors' in config['config'] and len(config['config']['apiMirrors']) > 0):
+            mirror = random.choice(config['config']['apiMirrors'])
+            print(" ➤ [ + ] Using API Mirror: "+mirror)
+            tweet = requests.get(mirror+"?url="+video_link).json()
+    print (" ➤ [ ✔ ] Unofficial API Success")
+    return link_to_vnf_from_tweet_data(tweet,video_link)
+
+
+def link_to_vnf_from_api(video_link):
+    tweet = get_tweet_data_from_api(video_link)
+    return link_to_vnf_from_tweet_data(tweet,video_link)
+
 def link_to_vnf_from_youtubedl(video_link):
     print(" ➤ [ X ] Attempting to download tweet info via YoutubeDL: " + video_link)
-    with youtube_dl.YoutubeDL({'outtmpl': '%(id)s.%(ext)s'}) as ydl:
+    with yt_dlp.YoutubeDL({'outtmpl': '%(id)s.%(ext)s'}) as ydl:
         result = ydl.extract_info(video_link, download=False)
         vnf    = tweetInfo(result['url'], video_link, result['description'].rsplit(' ',1)[0], result['thumbnail'], result['uploader'])
         return vnf
@@ -365,7 +375,13 @@ def link_to_vnf(video_link): # Return a VideoInfo object or die trying
         except Exception as e:
             print(" ➤ [ !!! ] API Failed")
             print(e)
-            return link_to_vnf_from_youtubedl(video_link)
+            try:
+                return link_to_vnf_from_unofficial_api(video_link)
+            except Exception as e:
+                print(" ➤ [ !!! ] UNOFFICIAL API Failed")
+                print(e)
+                return link_to_vnf_from_youtubedl(video_link) # This is the last resort, will only work for videos
+                
     elif config['config']['method'] == 'api':
         try:
             return link_to_vnf_from_api(video_link)
@@ -383,69 +399,6 @@ def link_to_vnf(video_link): # Return a VideoInfo object or die trying
     else:
         print("Please set the method key in your config file to 'api' 'youtube-dl' or 'hybrid'")
         return None
-
-def getVnfFromLinkCache(video_link):
-    if link_cache_system == "db":
-        collection = db.linkCache
-        vnf        = collection.find_one({'tweet': video_link})
-        # print(vnf)
-        if vnf != None: 
-            hits   = ( vnf['hits'] + 1 ) 
-            print(" ➤ [ ✔ ] Link located in DB cache. " + "hits on this link so far: [" + str(hits) + "]")
-            query  = { 'tweet': video_link }
-            change = { "$set" : { "hits" : hits } }
-            out    = db.linkCache.update_one(query, change)
-            return vnf
-        else:
-            print(" ➤ [ X ] Link not in DB cache")
-            return None
-    elif link_cache_system == "json":
-        if video_link in link_cache:
-            print("Link located in json cache")
-            vnf = link_cache[video_link]
-            return vnf
-        else:
-            print(" ➤ [ X ] Link not in json cache")
-            return None
-    elif link_cache_system == "dynamodb":
-        table = client.Table(DYNAMO_CACHE_TBL)
-        response = table.get_item(
-            Key={
-                'tweet': video_link
-            }
-        )
-        if 'Item' in response:
-            print("Link located in dynamodb cache")
-            vnf = response['Item']['vnf']
-            return vnf
-        else:
-            print(" ➤ [ X ] Link not in dynamodb cache")
-            return None
-
-def addVnfToLinkCache(video_link, vnf):
-    if link_cache_system == "db":
-        try:
-            out = db.linkCache.insert_one(vnf)
-            print(" ➤ [ + ] Link added to DB cache ")
-            return True
-        except Exception:
-            print(" ➤ [ X ] Failed to add link to DB cache")
-            return None
-    elif link_cache_system == "json":
-        link_cache[video_link] = vnf
-        with open("links.json", "w") as outfile: 
-            json.dump(link_cache, outfile, indent=4, sort_keys=True)
-            return None
-    elif link_cache_system == "dynamodb":
-        table = client.Table(DYNAMO_CACHE_TBL)
-        table.put_item(
-            Item={
-                'tweet': video_link,
-                'vnf': vnf
-            }
-        )
-        print(" ➤ [ + ] Link added to dynamodb cache ")
-        return True
 
 def message(text):
     return render_template(
@@ -479,10 +432,12 @@ def embed(video_link, vnf, image):
     except:
         vnf['likes'] = 0; vnf['rts'] = 0; vnf['time'] = 0
         print(' ➤ [ X ] Failed QRT check - old VNF object')
-        
+    appNamePost = ""
     if vnf['type'] == "Text": # Change the template based on tweet type
         template = 'text.html'
     if vnf['type'] == "Image":
+        if vnf['images'][4]!="1":
+            appNamePost = " - Image " + str(image+1) + "/" + str(vnf['images'][4])
         image = vnf['images'][image]
         template = 'image.html'
     if vnf['type'] == "Video":
@@ -511,13 +466,75 @@ def embed(video_link, vnf, image):
         user       = vnf['uploader'], 
         video_link = video_link, 
         color      = color, 
-        appname    = config['config']['appname'], 
+        appname    = config['config']['appname']+appNamePost, 
         repo       = config['config']['repo'], 
         url        = config['config']['url'], 
         urlDesc    = urlDesc, 
         urlUser    = urlUser, 
         urlLink    = urlLink,
         tweetLink  = vnf['tweet'] )
+
+
+def embedCombined(video_link):
+    cached_vnf = getVnfFromLinkCache(video_link)
+
+    if cached_vnf == None:
+        try:
+            vnf = link_to_vnf(video_link)
+            addVnfToLinkCache(video_link, vnf)
+            return embedCombinedVnf(video_link, vnf)
+
+        except Exception as e:
+            print(e)
+            return message(msgs.failedToScan)
+    else:
+        return embedCombinedVnf(video_link, cached_vnf)
+
+def embedCombinedVnf(video_link,vnf):
+    if vnf['type'] != "Image" or vnf['images'][4] == "1":
+        return embed(video_link, vnf, 0)
+    desc    = re.sub(r' http.*t\.co\S+', '', vnf['description'])
+    urlUser = urllib.parse.quote(vnf['uploader'])
+    urlDesc = urllib.parse.quote(desc)
+    urlLink = urllib.parse.quote(video_link)
+    likeDisplay = ("\n\n💖 " + str(vnf['likes']) + " 🔁 " + str(vnf['rts']) + "\n")
+
+    if vnf['qrt'] == {}: # Check if this is a QRT and modify the description
+            desc = (desc + likeDisplay)
+    else:
+        qrtDisplay = ("\n─────────────\n ➤ QRT of " + vnf['qrt']['handle'] + " (@" + vnf['qrt']['screen_name'] + "):\n─────────────\n'" + vnf['qrt']['desc'] + "'")
+        desc = (desc + qrtDisplay +  likeDisplay)
+
+    color = "#7FFFD4" # Green
+
+    if vnf['nsfw'] == True:
+        color = "#800020" # Red
+    image = "https://vxtwitter.com/rendercombined.jpg?imgs="
+    for i in range(0,int(vnf['images'][4])):
+        image = image + vnf['images'][i] + ","
+    image = image[:-1] # Remove last comma
+    return render_template(
+        'image.html', 
+        likes      = vnf['likes'], 
+        rts        = vnf['rts'], 
+        time       = vnf['time'], 
+        screenName = vnf['screen_name'], 
+        vidlink    = vnf['url'], 
+        pfp        = vnf['pfp'],  
+        vidurl     = vnf['url'], 
+        desc       = desc,
+        pic        = image,
+        user       = vnf['uploader'], 
+        video_link = video_link, 
+        color      = color, 
+        appname    = config['config']['appname'] + " - View original tweet for full quality", 
+        repo       = config['config']['repo'], 
+        url        = config['config']['url'], 
+        urlDesc    = urlDesc, 
+        urlUser    = urlUser, 
+        urlLink    = urlLink,
+        tweetLink  = vnf['tweet'] )
+
 
 def tweetType(tweet): # Are we dealing with a Video, Image, or Text tweet?
     if 'extended_entities' in tweet:
