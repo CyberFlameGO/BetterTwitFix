@@ -370,17 +370,17 @@ def link_to_vnf_from_youtubedl(video_link):
 
 def link_to_vnf(video_link): # Return a VideoInfo object or die trying
     if config['config']['method'] == 'hybrid':
+        #try:
+        #    return link_to_vnf_from_api(video_link)
+        #except Exception as e:
+        #    print(" ➤ [ !!! ] API Failed")
+        #print(e)
         try:
-            return link_to_vnf_from_api(video_link)
+            return link_to_vnf_from_unofficial_api(video_link)
         except Exception as e:
-            print(" ➤ [ !!! ] API Failed")
+            print(" ➤ [ !!! ] UNOFFICIAL API Failed")
             print(e)
-            try:
-                return link_to_vnf_from_unofficial_api(video_link)
-            except Exception as e:
-                print(" ➤ [ !!! ] UNOFFICIAL API Failed")
-                print(e)
-                return link_to_vnf_from_youtubedl(video_link) # This is the last resort, will only work for videos
+            return link_to_vnf_from_youtubedl(video_link) # This is the last resort, will only work for videos
                 
     elif config['config']['method'] == 'api':
         try:
